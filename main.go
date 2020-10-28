@@ -5,13 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 )
 
 type User struct {
@@ -28,27 +29,58 @@ type Error struct {
 	Message string `json:"message"`
 }
 
-func createToken(user User) (string, error) {
-	var err error
+const (
+	secret = "VgHIOzK076FnCHA3NYgrJ2fZdfr9y5RRV5XBgwqvgNzNNop/7jC7Bg=="
+	userIDKey = "user_id"
+	iatKey =    "iat"
+	expKey =    "exp"
+	lifetime =  30 * time.Minute
+)
 
-	secret := "secret"
+type Auth struct {
+	UserID int
+	Iat    int64
+}
 
+func Generate(userID int, now time.Time) (string, error){
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"email": user.Email,
-		"iss": "__init__",
+		userIDKey: userID,
+		iatKey:    now.Unix(),
+		expKey:    now.Add(lifetime).Unix(),
 	})
 
-	spew.Dump(token)
-	tokenString, err := token.SignedString([]byte(secret))
+	return token.SignedString([]byte(secret))
+}
 
-	fmt.Println("-----------------------")
-	fmt.Println("tokenString", tokenString)
 
-	if err != nil {
-		log.Fatal(err)
-	}
+func tokenVerify(r *http.Request) (string, string) {
+		authHeader := r.Header.Get("Authorization")
+		bearerToken := strings.Split(authHeader, " ")
+		fmt.Println("bearerToken: ", bearerToken)
 
-	return tokenString, nil
+		if len(bearerToken) == 2 {
+			authToken := bearerToken[1]
+
+			token, error := jwt.Parse(authToken, func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("エラーが発生しました。")
+				}
+				return []byte(secret), nil
+			})
+
+			if error != nil {
+				return "",  "failed token parse"
+			}
+
+			if token.Valid {
+				return "ok", ""
+
+			} else {
+				return "",  "failed token valid"
+			}
+		} else {
+			return "","invalid token"
+		}
 }
 
 func errorInResponse(w http.ResponseWriter, status int, error Error){
@@ -70,13 +102,13 @@ func signup(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&user)
 
 	if user.Email == "" {
-		error.Message = "Emailは必須です"
+		error.Message = "require email"
 		errorInResponse(w, http.StatusBadRequest, error)
 		return
 	}
 
 	if user.Password == "" {
-		error.Message = "パスワードは必須です"
+		error.Message = "require password"
 		errorInResponse(w, http.StatusBadRequest, error)
 		return
 	}
@@ -91,17 +123,13 @@ func signup(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(err)
 	}
 
-	fmt.Println("パスワード: ", user.Password)
-	fmt.Println("ハッシュ化されたパスワード", hash)
-
 	user.Password = string(hash)
-	fmt.Println("コンバート後のパスワード: ", user.Password)
 
 	sql_query := "INSERT INTO USERS(EMAIL, PASSWORD) VALUES($1, $2) RETURNING ID;"
 	err = db.QueryRow(sql_query, user.Email, user.Password).Scan(&user.ID)
 
 	if err != nil {
-		error.Message = "サーバーエラー"
+		error.Message = "sever error"
 		errorInResponse(w, http.StatusInternalServerError, error)
 		return
 	}
@@ -122,13 +150,13 @@ func login(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&user)
 
 	if user.Email == "" {
-		error.Message = "Emailは必須です"
+		error.Message = "require email"
 		errorInResponse(w, http.StatusBadRequest, error)
 		return
 	}
 
 	if user.Password == "" {
-		error.Message = "パスワードは必須です"
+		error.Message = "require password"
 		errorInResponse(w, http.StatusBadRequest, error)
 		return
 	}
@@ -141,7 +169,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			error.Message = "ユーザーが存在しません"
+			error.Message = "no match user"
 			errorInResponse(w, http.StatusBadRequest, error)
 		} else {
 			log.Fatal(err)
@@ -154,12 +182,12 @@ func login(w http.ResponseWriter, r *http.Request) {
 	err = bcrypt.CompareHashAndPassword([]byte(hasedPassword), []byte(password))
 
 	if err != nil {
-		error.Message = "無効なパスワードです"
+		error.Message = "invalid password"
 		errorInResponse(w, http.StatusUnauthorized, error)
 		return
 	}
 
-	token, err := createToken(user)
+	token, err := Generate(user.ID, time.Now())
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -172,6 +200,14 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 var db *sql.DB
 
+func hoge(w http.ResponseWriter, r *http.Request){
+	ok, _ := tokenVerify(r)
+	if ok != "ok" {
+		errorInResponse(w, http.StatusBadRequest, Error{Message: "invalid token"})
+		return
+	}
+	w.Write([]byte("successfully verify token"))
+}
 
 func main() {
 	i := tool.Info{}
@@ -197,8 +233,9 @@ func main() {
 
 	router.HandleFunc("/signup", signup).Methods("POST")
 	router.HandleFunc("/login", login).Methods("POST")
+	router.HandleFunc("/hoge", hoge).Methods("GET")
 
-	log.Println("サーバー起動: 8000 port で受信")
+	log.Println("server start. listen to 8000 port")
 
 	log.Fatal(http.ListenAndServe(":8000", router))
 }
